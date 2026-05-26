@@ -17,3 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StitchResult` with the stitched canvas, homography, inlier count, and mean
   reprojection error (the planar-fit signal a later angulation engine will
   consume).
+- Characterization experiment script `experiments/characterize_angulation.py`
+  (research tool, not a shipped engine feature) that prints reprojection-error
+  distributions for synthetic extension vs angulation regimes to support
+  future threshold selection.
