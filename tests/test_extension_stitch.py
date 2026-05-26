@@ -79,8 +79,23 @@ def test_known_homography_is_recovered_within_one_pixel():
         f"too few inliers for a clean synthetic case: {result.inlier_count}"
     )
 
+    expected_h = np.linalg.inv(true_h)
+    corners = np.float32(
+        [[0, 0], [0, IMG_H], [IMG_W, IMG_H], [IMG_W, 0]]
+    ).reshape(-1, 1, 2)
+    recovered_corners = cv2.perspectiveTransform(corners, result.homography)
+    expected_corners = cv2.perspectiveTransform(corners, expected_h)
+    corner_errors = np.linalg.norm(
+        recovered_corners - expected_corners, axis=2
+    ).ravel()
+    max_corner_error = float(corner_errors.max())
+    assert max_corner_error <= 1.0, (
+        f"recovered homography deviates from ground truth: "
+        f"max corner error {max_corner_error:.4f} px"
+    )
 
-def test_no_overlap_raises_insufficient_overlap():
+
+def test_unmatchable_features_raise_insufficient_overlap():
     image_a = _make_feature_image(seed=11)
     rng = np.random.default_rng(424242)
     image_b = rng.integers(0, 256, size=(IMG_H, IMG_W), dtype=np.uint8)
