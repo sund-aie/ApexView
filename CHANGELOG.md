@@ -19,5 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consume).
 - Characterization experiment script `experiments/characterize_angulation.py`
   (research tool, not a shipped engine feature) that prints reprojection-error
-  distributions for synthetic extension vs angulation regimes to support
-  future threshold selection.
+  AND inlier-count distributions for synthetic extension vs angulation regimes
+  to support future threshold selection. The angulation regime renders a
+  two-depth 3D scene from a tilted camera so the warp produces genuine
+  depth-dependent parallax no single homography can model.
