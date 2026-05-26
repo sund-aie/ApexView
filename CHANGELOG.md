@@ -27,3 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implemented), keyed on the `StitchResult.inlier_count` from the existing
   stitcher against the tunable `EXTENSION_MIN_INLIERS` threshold (provisional
   value 100, chosen from synthetic characterization).
+- Read-only DICOM input adapter (`apexview.io.dicom_reader`): `load_dicom`
+  returns a `RadiographImage` carrying the raw pixel array, a per-image
+  min/max-rescaled uint8 view ready for the engine, bit depth, and a
+  pixel-spacing field that honestly reports `None` when neither
+  `ImagerPixelSpacing` nor `PixelSpacing` is present (never fabricates a
+  default). Adds `pydicom` as a runtime dependency.
