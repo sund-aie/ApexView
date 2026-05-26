@@ -7,6 +7,10 @@ name = "apexview"
 version = "0.0.1"
 description = "Headless dental radiograph processing engine."
 requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
