@@ -11,10 +11,14 @@ dependencies = [
     "numpy>=1.26",
     "opencv-python>=4.9",
     "pydicom>=3.0",
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+
+[project.scripts]
+apexview = "apexview.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
