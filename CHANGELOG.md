@@ -35,3 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pixel-spacing field that honestly reports `None` when neither
   `ImagerPixelSpacing` nor `PixelSpacing` is present (never fabricates a
   default). Adds `pydicom` as a runtime dependency.
+- Command-line interface (`apexview.cli`, installed as the `apexview` console
+  script): a thin client over the reader and classifier with an `inspect` mode
+  (reports one DICOM's dimensions, bit depth, honest pixel-spacing status, and
+  intensity range) and an `analyze` mode (classifies a two-file pair as
+  EXTENSION or ANGULATION, optionally saving the engine's stitched PNG via
+  `--out`). Prints only engine/reader-owned values, never recomputing them,
+  and reports errors as clean messages with exit codes instead of tracebacks.
+  Adds `pillow` as a runtime dependency for PNG saving only.
