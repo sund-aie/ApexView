@@ -43,3 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--out`). Prints only engine/reader-owned values, never recomputing them,
   and reports errors as clean messages with exit codes instead of tracebacks.
   Adds `pillow` as a runtime dependency for PNG saving only.
+- Two-view stereo geometry (`apexview.engine.stereo_geometry`):
+  `estimate_two_view_geometry` recovers the fundamental matrix of an angulated
+  pair via the same SIFT + Lowe matching convention as the stitcher, returning
+  a `TwoViewGeometry` with F, RANSAC inlier count, mean symmetric epipolar
+  error, and matches used. Refuses planar/degenerate scenes via a
+  homography-inlier-ratio guard, and pins down the `pts_b^T F pts_a = 0`
+  epipolar direction. Foundation math only — no pose, triangulation, or
+  correction yet.
