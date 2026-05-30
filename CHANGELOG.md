@@ -51,3 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   homography-inlier-ratio guard, and pins down the `pts_b^T F pts_a = 0`
   epipolar direction. Foundation math only — no pose, triangulation, or
   correction yet.
+- Preprocessing characterization experiment script
+  `experiments/characterize_preprocessing.py` (research tool, not a shipped
+  feature) that measures whether CLAHE / `equalizeHist` make two-view
+  geometry recoverable on real radiograph pairs, reporting Lowe matches,
+  RANSAC inlier count, mean epipolar error, and 4x4-grid spatial coverage of
+  surviving inliers per variant. The user runs it locally against their own
+  DICOM folder; no images enter the repo.
