@@ -58,3 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RANSAC inlier count, mean epipolar error, and 4x4-grid spatial coverage of
   surviving inliers per variant. The user runs it locally against their own
   DICOM folder; no images enter the repo.
+- Extended the preprocessing experiment with a SIFT-density A/B
+  (`sift_default` vs `sift_dense` via lowered `contrastThreshold`), sweeping
+  6 preprocess x SIFT combinations. Replaced the coverage-blind summary
+  with a coverage-first ranking (primary key `min(cov_a, cov_b)`, tiebreaker
+  inlier count) and a noise-trap flag for combinations whose keypoints
+  inflate without broadening inlier coverage. Still research-only; bakes in
+  nothing.
