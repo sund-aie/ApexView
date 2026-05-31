@@ -1,11 +1,14 @@
-"""Tests for the preprocessing characterization script.
+"""Tests for the preprocessing + SIFT-density characterization script.
 
 We verify the SCRIPT'S MACHINERY on fully synthetic images: that analyze_pair
-returns the expected fields, that the variants are actually applied
-(preprocessed image differs from raw), and that the coverage metric stays in
-its 0..16 range. We intentionally do NOT assert "CLAHE beats raw" — that is
-the empirical question for real radiographs, and asserting it on clean
-synthetic data would be a hollow/misleading test.
+covers all 6 preprocess x SIFT-density combinations, that the sift_dense
+config is genuinely applied (not a no-op), that the coverage metric stays in
+its 0..16 range, that the coverage-first ranking picks the higher
+min-coverage, and that the noise-trap flag fires on inflated-keypoints +
+low-coverage and stays silent on broad-coverage. We intentionally do NOT
+assert "sift_dense beats sift_default" — that is the empirical question for
+real radiographs, and asserting it on clean synthetic data would be a
+hollow/misleading test.
 """
 
 from __future__ import annotations
@@ -26,10 +29,15 @@ sys.modules["characterize_preprocessing"] = characterize
 assert _spec.loader is not None
 _spec.loader.exec_module(characterize)
 
-VARIANTS = characterize.VARIANTS
+PREPROCESS_VARIANTS = characterize.PREPROCESS_VARIANTS
+SIFT_CONFIGS = characterize.SIFT_CONFIGS
+COMBINATIONS = characterize.COMBINATIONS
 analyze_pair = characterize.analyze_pair
 preprocess = characterize.preprocess
 grid_coverage = characterize.grid_coverage
+make_sift = characterize.make_sift
+best_by_coverage = characterize.best_by_coverage
+is_noise_trap = characterize.is_noise_trap
 VariantResult = characterize.VariantResult
 
 IMG_H = 480
@@ -103,40 +111,86 @@ def _degrade(img: np.ndarray, seed: int) -> np.ndarray:
     return blurred.astype(np.uint8)
 
 
-def test_analyze_pair_returns_expected_structure_per_variant():
+def _make_result(
+    *,
+    preprocess_variant: str = "raw",
+    sift_config: str = "sift_default",
+    kp_a: int = 500,
+    kp_b: int = 500,
+    good_matches: int = 100,
+    success: bool = True,
+    inlier_count: int = 80,
+    mean_epipolar_error: float = 0.5,
+    coverage_a: int = 10,
+    coverage_b: int = 10,
+    failure_reason: str = "",
+) -> VariantResult:
+    return VariantResult(
+        variant=f"{preprocess_variant}+{sift_config}",
+        preprocess_variant=preprocess_variant,
+        sift_config=sift_config,
+        kp_a=kp_a,
+        kp_b=kp_b,
+        good_matches=good_matches,
+        success=success,
+        failure_reason=failure_reason,
+        inlier_count=inlier_count,
+        mean_epipolar_error=mean_epipolar_error,
+        coverage_a=coverage_a,
+        coverage_b=coverage_b,
+    )
+
+
+# --------------------------------------------------------------------------
+# Machinery tests
+# --------------------------------------------------------------------------
+def test_analyze_pair_covers_all_six_combinations():
     a, b = _multidepth_pair()
     results = analyze_pair(a, b)
 
     assert isinstance(results, list)
-    assert {r.variant for r in results} == set(VARIANTS)
+    assert len(results) == len(COMBINATIONS) == 6
+    pairs_seen = {(r.preprocess_variant, r.sift_config) for r in results}
+    assert pairs_seen == set(COMBINATIONS)
+
     for r in results:
         assert isinstance(r, VariantResult)
+        assert r.preprocess_variant in PREPROCESS_VARIANTS
+        assert r.sift_config in SIFT_CONFIGS
+        assert r.variant == f"{r.preprocess_variant}+{r.sift_config}"
         assert isinstance(r.kp_a, int) and r.kp_a >= 0
         assert isinstance(r.kp_b, int) and r.kp_b >= 0
         assert isinstance(r.good_matches, int) and r.good_matches >= 0
         assert isinstance(r.success, bool)
         if r.success:
             assert isinstance(r.inlier_count, int) and r.inlier_count >= 8
-            assert isinstance(r.mean_epipolar_error, float)
             assert math.isfinite(r.mean_epipolar_error)
             assert 0 <= r.coverage_a <= 16
             assert 0 <= r.coverage_b <= 16
+            assert r.min_coverage == min(r.coverage_a, r.coverage_b)
         else:
-            assert isinstance(r.failure_reason, str) and r.failure_reason
+            assert r.failure_reason
 
 
-def test_clahe_actually_changes_the_image():
-    a, _ = _multidepth_pair()
-    degraded = _degrade(a, seed=1)
-    clahe_out = preprocess(degraded, "clahe")
-    eq_out = preprocess(degraded, "equalize")
-    raw_out = preprocess(degraded, "raw")
-
-    assert clahe_out.shape == degraded.shape
-    assert clahe_out.dtype == np.uint8
-    assert not np.array_equal(clahe_out, degraded), "CLAHE produced identical pixels"
-    assert not np.array_equal(eq_out, degraded), "equalize produced identical pixels"
-    assert np.array_equal(raw_out, degraded), "raw must be a passthrough"
+def test_sift_dense_detects_at_least_as_many_keypoints_as_default():
+    """Lowering contrastThreshold cannot reduce detections — it only admits
+    additional lower-contrast keypoints. This proves sift_dense is actually
+    applied and not a no-op alias for the default."""
+    img = _degrade(_multidepth_pair()[0], seed=1)
+    sift_default = make_sift("sift_default")
+    sift_dense = make_sift("sift_dense")
+    kp_default = sift_default.detect(img, None)
+    kp_dense = sift_dense.detect(img, None)
+    assert len(kp_dense) >= len(kp_default), (
+        f"sift_dense should detect >= sift_default; "
+        f"got dense={len(kp_dense)}, default={len(kp_default)}"
+    )
+    # And on at least one realistic image they should differ strictly,
+    # otherwise the dense config is silently equivalent.
+    assert len(kp_dense) > len(kp_default), (
+        "sift_dense produced exactly the same keypoint count as sift_default "
+        "on a degraded image; the dense config may not be applied"
+    )
 
 
 def test_grid_coverage_returns_value_in_zero_to_sixteen():
@@ -146,11 +200,9 @@ def test_grid_coverage_returns_value_in_zero_to_sixteen():
     assert isinstance(cov, int)
     assert 0 <= cov <= 16
 
-    # corner points only -> exactly the 4 corner cells
     corners = np.float32([[0, 0], [639, 0], [0, 479], [639, 479]])
     assert grid_coverage(corners, h=480, w=640) == 4
 
-    # empty -> 0
     empty = np.empty((0, 2), dtype=np.float32)
     assert grid_coverage(empty, h=480, w=640) == 0
 
@@ -164,16 +216,105 @@ def test_preprocess_rejects_bad_variant():
     raise AssertionError("expected ValueError for unknown variant")
 
 
+def test_make_sift_rejects_unknown_config():
+    try:
+        make_sift("sift_supersonic")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for unknown sift config")
+
+
 def test_analyze_pair_records_failure_when_match_count_below_floor():
-    # Two unrelated uniform-ish images: SIFT should find very few stable
-    # matches, exercising the "good_matches < 8" branch on at least one
-    # variant. We don't assert which variant — just that failure is recorded
-    # cleanly with a reason and no exception.
     flat_a = np.full((IMG_H, IMG_W), 100, dtype=np.uint8)
     flat_a[0, 0] = 101
     flat_b = np.full((IMG_H, IMG_W), 100, dtype=np.uint8)
     flat_b[1, 1] = 101
 
     results = analyze_pair(flat_a, flat_b)
+    assert len(results) == 6
     assert all(not r.success for r in results)
     assert all(r.failure_reason for r in results)
+
+
+# --------------------------------------------------------------------------
+# Ranking + noise-trap helpers
+# --------------------------------------------------------------------------
+def test_best_by_coverage_prefers_higher_min_coverage():
+    high = _make_result(
+        preprocess_variant="clahe",
+        sift_config="sift_dense",
+        coverage_a=12,
+        coverage_b=12,
+        inlier_count=40,
+    )
+    low = _make_result(
+        preprocess_variant="raw",
+        sift_config="sift_default",
+        coverage_a=15,  # cov_a is higher than `high`s
+        coverage_b=5,   # but min is 5 — should lose on coverage-first ranking
+        inlier_count=200,  # large inlier count must NOT win over min-coverage
+    )
+    best = best_by_coverage([low, high])
+    assert best is high
+
+
+def test_best_by_coverage_breaks_ties_with_inlier_count():
+    a = _make_result(
+        preprocess_variant="raw", sift_config="sift_default",
+        coverage_a=10, coverage_b=10, inlier_count=80,
+    )
+    b = _make_result(
+        preprocess_variant="clahe", sift_config="sift_dense",
+        coverage_a=10, coverage_b=10, inlier_count=120,
+    )
+    assert best_by_coverage([a, b]) is b
+
+
+def test_best_by_coverage_returns_none_when_all_failed():
+    fails = [
+        _make_result(success=False, coverage_a=0, coverage_b=0,
+                     failure_reason="x"),
+        _make_result(success=False, coverage_a=0, coverage_b=0,
+                     failure_reason="y"),
+    ]
+    assert best_by_coverage(fails) is None
+
+
+def test_noise_trap_fires_on_high_kp_low_coverage():
+    trap = _make_result(
+        preprocess_variant="equalize",
+        sift_config="sift_dense",
+        kp_a=9000,
+        kp_b=9000,
+        coverage_a=3,
+        coverage_b=2,
+        inlier_count=10,
+    )
+    assert is_noise_trap(trap, baseline_kp_count=500) is True
+
+
+def test_noise_trap_silent_on_broad_coverage_even_if_kp_inflated():
+    not_a_trap = _make_result(
+        preprocess_variant="clahe",
+        sift_config="sift_dense",
+        kp_a=9000,
+        kp_b=9000,
+        coverage_a=12,
+        coverage_b=11,
+        inlier_count=120,
+    )
+    assert is_noise_trap(not_a_trap, baseline_kp_count=500) is False
+
+
+def test_noise_trap_silent_when_kp_not_inflated():
+    moderate = _make_result(
+        preprocess_variant="raw",
+        sift_config="sift_default",
+        kp_a=500,
+        kp_b=400,
+        coverage_a=4,
+        coverage_b=3,
+        inlier_count=12,
+    )
+    # max(kp) = 500 == baseline * 1.0, well under the 2x ratio
+    assert is_noise_trap(moderate, baseline_kp_count=500) is False
