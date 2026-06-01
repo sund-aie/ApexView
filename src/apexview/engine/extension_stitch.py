@@ -26,6 +26,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from apexview.engine.preprocessing import preprocess_for_matching
+
 _LOWE_RATIO = 0.75
 _MIN_MATCHES = 4
 _RANSAC_REPROJ_THRESHOLD = 3.0
@@ -62,11 +64,21 @@ def _validate(image_a: np.ndarray, image_b: np.ndarray) -> None:
         )
 
 
-def stitch_extension(image_a: np.ndarray, image_b: np.ndarray) -> StitchResult:
+def stitch_extension(
+    image_a: np.ndarray, image_b: np.ndarray, apply_clahe: bool = True
+) -> StitchResult:
     """Stitch two extension-pair grayscale radiographs into one wider image.
 
     image_a is treated as the reference frame. image_b is warped into image_a's
     coordinate system via a homography recovered from SIFT + Lowe + RANSAC.
+
+    With ``apply_clahe=True`` (the default), each input image is passed
+    through the shared :func:`preprocess_for_matching` before SIFT, which
+    materially improves inlier spatial coverage on real radiographs. The
+    preprocessing is applied to the SIFT-input copies only; the stitched
+    output canvas is built from the caller's ORIGINAL pixels, and the
+    caller's input arrays are never mutated. Pass ``apply_clahe=False`` to
+    feed SIFT the raw images (useful for tests that isolate raw-input math).
 
     Raises:
         ValueError: invalid inputs (non-2D, empty, or mismatched dtypes).
@@ -75,9 +87,12 @@ def stitch_extension(image_a: np.ndarray, image_b: np.ndarray) -> StitchResult:
     """
     _validate(image_a, image_b)
 
+    match_a = preprocess_for_matching(image_a, apply_clahe=apply_clahe)
+    match_b = preprocess_for_matching(image_b, apply_clahe=apply_clahe)
+
     sift = cv2.SIFT_create()
-    kp_a, des_a = sift.detectAndCompute(image_a, None)
-    kp_b, des_b = sift.detectAndCompute(image_b, None)
+    kp_a, des_a = sift.detectAndCompute(match_a, None)
+    kp_b, des_b = sift.detectAndCompute(match_b, None)
 
     if des_a is None or des_b is None or len(kp_a) < 2 or len(kp_b) < 2:
         raise InsufficientOverlapError(

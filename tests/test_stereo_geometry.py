@@ -289,3 +289,29 @@ def test_two_view_geometry_contract():
     assert math.isfinite(geom.mean_epipolar_error)
     assert isinstance(geom.num_matches_used, int)
     assert geom.num_matches_used >= geom.inlier_count
+
+
+def test_apply_clahe_false_bypasses_preprocessing():
+    """With apply_clahe=False, the end-to-end SIFT pipeline must reproduce
+    the original raw-input behavior: same recoverable F to within the same
+    SIFT-noise tolerance. The False and True branches must also produce
+    measurably different inlier sets, otherwise the toggle is being
+    silently ignored."""
+    img_a, img_b = _multidepth_image_pair()
+    raw = estimate_two_view_geometry(img_a, img_b, apply_clahe=False)
+    cl = estimate_two_view_geometry(img_a, img_b, apply_clahe=True)
+    assert raw.inlier_count >= 8
+    assert raw.mean_epipolar_error <= 2.0
+    assert raw.inlier_count != cl.inlier_count, (
+        "apply_clahe toggle appears to have no effect on matching results; "
+        "the parameter may not be threaded into preprocess_for_matching"
+    )
+
+
+def test_clahe_does_not_mutate_caller_images():
+    img_a, img_b = _multidepth_image_pair()
+    snap_a = img_a.copy()
+    snap_b = img_b.copy()
+    _ = estimate_two_view_geometry(img_a, img_b)  # default apply_clahe=True
+    assert np.array_equal(img_a, snap_a)
+    assert np.array_equal(img_b, snap_b)
