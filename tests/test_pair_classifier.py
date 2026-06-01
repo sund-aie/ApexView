@@ -202,3 +202,26 @@ def test_classification_result_contract():
     assert ext_result.pair_type is not ang_result.pair_type, (
         "extension and angulation cases must produce different verdicts"
     )
+
+
+def test_classifier_inherits_default_clahe_from_stitcher():
+    """classify_pair calls stitch_extension internally, which now defaults
+    to apply_clahe=True. Verify the classifier transparently gets CLAHE
+    (no second CLAHE call is needed in the classifier) and still produces
+    different verdicts on extension vs angulation cases. This is the
+    'single home for preprocessing' contract: CLAHE lives in the engine,
+    not in the classifier."""
+    image_a = _make_single_layer_image(seed=11)
+    image_b = cv2.warpPerspective(
+        image_a, _extension_homography(angle_deg=1.5, dx=60.0), (IMG_W, IMG_H)
+    )
+    ext = classify_pair(image_a, image_b)
+
+    image_c = _render_two_layer_scene(seed=11, angle_deg=0.0)
+    image_d = _render_two_layer_scene(seed=11, angle_deg=18.0)
+    ang = classify_pair(image_c, image_d)
+
+    assert ext.pair_type is PairType.EXTENSION
+    assert ang.pair_type is PairType.ANGULATION
+    assert ext.inlier_count >= EXTENSION_MIN_INLIERS
+    assert ang.inlier_count < EXTENSION_MIN_INLIERS

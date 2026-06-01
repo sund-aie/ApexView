@@ -65,3 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inlier count) and a noise-trap flag for combinations whose keypoints
   inflate without broadening inlier coverage. Still research-only; bakes in
   nothing.
+- Shared CLAHE preprocessing (`apexview.engine.preprocessing`): a single
+  `preprocess_for_matching` entry point (clipLimit=2.0, tileGridSize=8x8)
+  is now applied by default to the SIFT inputs of both `stitch_extension`
+  and `estimate_two_view_geometry`. Each exposes `apply_clahe=True` (default)
+  so callers can bypass it; the originals are never mutated, and the
+  stitched output canvas is built from the caller's original pixels. The
+  classifier inherits the default transparently via the stitcher. A denser
+  SIFT configuration was evaluated and deliberately NOT adopted as default
+  (documented as a constant only, not wired in).

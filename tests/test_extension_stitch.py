@@ -155,3 +155,54 @@ def test_output_contract():
     assert (h_out * w_out) > (IMG_H * IMG_W), (
         "stitched canvas should be strictly larger than a single input (no clipping)"
     )
+
+
+def test_apply_clahe_false_bypasses_preprocessing():
+    """With apply_clahe=False, the engine must reproduce the original
+    raw-input behavior: the known-homography recovery still holds to the
+    same tight tolerance, AND the False branch must produce a measurably
+    different inlier set than the True branch (otherwise the toggle is
+    being silently ignored)."""
+    image_a = _make_feature_image()
+    dx, dy, angle = 60.0, 4.0, 2.0
+    cx, cy = IMG_W / 2.0, IMG_H / 2.0
+    true_h = _build_extension_homography(dx, dy, angle, (cx, cy))
+    image_b = cv2.warpPerspective(image_a, true_h, (IMG_W, IMG_H))
+
+    raw_result = stitch_extension(image_a, image_b, apply_clahe=False)
+    clahe_result = stitch_extension(image_a, image_b, apply_clahe=True)
+
+    assert raw_result.mean_reprojection_error <= 1.0, (
+        f"raw-mode reprojection error too high: {raw_result.mean_reprojection_error}"
+    )
+    expected_h = np.linalg.inv(true_h)
+    corners = np.float32(
+        [[0, 0], [0, IMG_H], [IMG_W, IMG_H], [IMG_W, 0]]
+    ).reshape(-1, 1, 2)
+    max_corner_error = float(
+        np.linalg.norm(
+            cv2.perspectiveTransform(corners, raw_result.homography)
+            - cv2.perspectiveTransform(corners, expected_h),
+            axis=2,
+        ).max()
+    )
+    assert max_corner_error <= 1.0
+
+    # If the toggle were ignored, both calls would produce identical results.
+    assert raw_result.inlier_count != clahe_result.inlier_count, (
+        "apply_clahe toggle appears to have no effect on matching results; "
+        "the parameter may not be threaded into preprocess_for_matching"
+    )
+
+
+def test_clahe_does_not_mutate_caller_images():
+    image_a = _make_feature_image()
+    image_b = cv2.warpPerspective(
+        image_a, _build_extension_homography(60.0, 4.0, 2.0, (IMG_W / 2.0, IMG_H / 2.0)),
+        (IMG_W, IMG_H),
+    )
+    snap_a = image_a.copy()
+    snap_b = image_b.copy()
+    _ = stitch_extension(image_a, image_b)  # default apply_clahe=True
+    assert np.array_equal(image_a, snap_a)
+    assert np.array_equal(image_b, snap_b)

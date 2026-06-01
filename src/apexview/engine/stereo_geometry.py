@@ -33,6 +33,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from apexview.engine.preprocessing import preprocess_for_matching
+
 # Mirror extension_stitch's matching convention exactly.
 _LOWE_RATIO = 0.75
 
@@ -218,9 +220,17 @@ def estimate_fundamental_from_points(
 
 
 def estimate_two_view_geometry(
-    image_a: np.ndarray, image_b: np.ndarray
+    image_a: np.ndarray, image_b: np.ndarray, apply_clahe: bool = True
 ) -> TwoViewGeometry:
     """Estimate the fundamental matrix relating two radiographs.
+
+    With ``apply_clahe=True`` (the default), each input image is passed
+    through the shared :func:`preprocess_for_matching` before SIFT. CLAHE
+    only rescales intensities, so the matched keypoint coordinates and the
+    resulting fundamental matrix remain in the caller's image coordinate
+    frame; nothing about the geometry math changes. The caller's input
+    arrays are never mutated. Pass ``apply_clahe=False`` to isolate
+    raw-input behavior.
 
     Raises:
         ValueError: invalid inputs (non-2D, empty, or mismatched dtypes).
@@ -229,7 +239,9 @@ def estimate_two_view_geometry(
             minimum.
     """
     _validate(image_a, image_b)
-    pts_a, pts_b = _match_points(image_a, image_b)
+    match_a = preprocess_for_matching(image_a, apply_clahe=apply_clahe)
+    match_b = preprocess_for_matching(image_b, apply_clahe=apply_clahe)
+    pts_a, pts_b = _match_points(match_a, match_b)
 
     if pts_a.shape[0] < _MIN_CORRESPONDENCES:
         raise InsufficientGeometryError(
