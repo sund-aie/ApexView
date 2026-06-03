@@ -28,7 +28,7 @@ consumer (A2/A3, a UI) reads those fields and must NOT recompute them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -73,6 +73,16 @@ class TwoViewGeometry:
     inlier_count: int
     mean_epipolar_error: float
     num_matches_used: int
+    # Additive (Task A2): exposes the inlier-filtered correspondences so the
+    # downstream pose/triangulation layer can reuse them without re-running
+    # SIFT or RANSAC. Defaults to empty arrays so any code that constructed
+    # TwoViewGeometry without these fields keeps working.
+    inlier_points_a: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float32)
+    )
+    inlier_points_b: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float32)
+    )
 
 
 def _validate(image_a: np.ndarray, image_b: np.ndarray) -> None:
@@ -251,13 +261,15 @@ def estimate_two_view_geometry(
 
     F, inlier_mask = estimate_fundamental_from_points(pts_a, pts_b)
     inlier_count = int(inlier_mask.sum())
-    mean_error = mean_symmetric_epipolar_error(
-        F, pts_a[inlier_mask], pts_b[inlier_mask]
-    )
+    inlier_pts_a = pts_a[inlier_mask]
+    inlier_pts_b = pts_b[inlier_mask]
+    mean_error = mean_symmetric_epipolar_error(F, inlier_pts_a, inlier_pts_b)
 
     return TwoViewGeometry(
         fundamental_matrix=F,
         inlier_count=inlier_count,
         mean_epipolar_error=mean_error,
         num_matches_used=int(pts_a.shape[0]),
+        inlier_points_a=inlier_pts_a,
+        inlier_points_b=inlier_pts_b,
     )

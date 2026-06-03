@@ -74,3 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classifier inherits the default transparently via the stitcher. A denser
   SIFT configuration was evaluated and deliberately NOT adopted as default
   (documented as a constant only, not wired in).
+- Relative two-view pose recovery and triangulation
+  (`apexview.engine.reconstruction`): `estimate_pose_and_triangulate`
+  returns a `RelativeReconstruction` with rotation, unit-norm translation
+  direction, a triangulated 3D point cloud in the first camera's frame at
+  RELATIVE scale, point count, mean reprojection error, and an
+  `intrinsics_were_assumed` flag. Includes an honest `assumed_intrinsics`
+  helper for the unknown-K case (focal defaults to max(w, h), principal
+  point at center). Builds on A1 via a small additive extension of
+  `TwoViewGeometry` to expose inlier correspondences. No metric scale, no
+  rectification, no multi-view.
