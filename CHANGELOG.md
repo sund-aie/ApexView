@@ -84,3 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   point at center). Builds on A1 via a small additive extension of
   `TwoViewGeometry` to expose inlier correspondences. No metric scale, no
   rectification, no multi-view.
+- Detector-plane 2D distance measurement (`apexview.engine.measurement`):
+  `measure_distance` converts the pixel distance between two image points
+  into millimetres via a `ScaleCalibration`, built either from physical
+  sensor size (anisotropic: per-axis mm/px from sensor width/height and the
+  image shape) or from a single known reference length (isotropic: assumes
+  square pixels). Per-axis conversion is applied before combining, so
+  anisotropic pixel spacing is handled correctly. Honest about its limits:
+  it is a flat detector-plane measurement, does NOT use the A2
+  reconstruction, and is NOT corrected for X-ray magnification or beam
+  angulation; every `Measurement` carries `magnification_corrected=False`.
+  No metric 3D, no reconstruction dependency, no new runtime dependencies.
