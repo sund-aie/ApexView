@@ -12,6 +12,7 @@ dependencies = [
     "opencv-python>=4.9",
     "pydicom>=3.0",
     "pillow>=10.0",
+    "PyQt6>=6.5",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +20,7 @@ dev = ["pytest"]
 
 [project.scripts]
 apexview = "apexview.cli:main"
+apexview-gui = "apexview.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
