@@ -22,7 +22,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from apexview.engine.pair_classifier import ClassificationResult, PairType
 from apexview.gui.app import (
     AnalysisDisplay,
+    compose_pivot_frame,
     format_analysis,
+    format_pivot_honesty,
     format_pixel_spacing,
     save_stitched_image,
 )
@@ -168,6 +170,78 @@ def test_save_stitched_image_writes_jpeg(tmp_path):
     out = tmp_path / "stitched.jpg"
     save_stitched_image(arr, out)
     assert out.exists() and out.stat().st_size > 0
+
+
+# --------------------------------------------------------------------------
+# compose_pivot_frame — pure numpy blend used by the pivot viewer
+# --------------------------------------------------------------------------
+def test_compose_pivot_frame_at_zero_returns_image_a():
+    rng = np.random.default_rng(2)
+    image_a = rng.integers(0, 256, size=(24, 32), dtype=np.uint8)
+    warped_b = rng.integers(0, 256, size=(24, 32), dtype=np.uint8)
+    frame = compose_pivot_frame(image_a, warped_b, t=0.0)
+    np.testing.assert_array_equal(frame, image_a)
+    assert frame.dtype == np.uint8
+
+
+def test_compose_pivot_frame_at_one_returns_warped_b():
+    rng = np.random.default_rng(3)
+    image_a = rng.integers(0, 256, size=(24, 32), dtype=np.uint8)
+    warped_b = rng.integers(0, 256, size=(24, 32), dtype=np.uint8)
+    frame = compose_pivot_frame(image_a, warped_b, t=1.0)
+    np.testing.assert_array_equal(frame, warped_b)
+    assert frame.dtype == np.uint8
+
+
+def test_compose_pivot_frame_at_half_is_rounded_average():
+    image_a = np.full((10, 12), 100, dtype=np.uint8)
+    warped_b = np.full((10, 12), 200, dtype=np.uint8)
+    frame = compose_pivot_frame(image_a, warped_b, t=0.5)
+    expected = np.full((10, 12), 150, dtype=np.uint8)
+    np.testing.assert_array_equal(frame, expected)
+    assert frame.dtype == np.uint8
+
+
+def test_compose_pivot_frame_clamps_t_outside_range():
+    image_a = np.full((6, 6), 50, dtype=np.uint8)
+    warped_b = np.full((6, 6), 150, dtype=np.uint8)
+    np.testing.assert_array_equal(
+        compose_pivot_frame(image_a, warped_b, t=-1.0), image_a
+    )
+    np.testing.assert_array_equal(
+        compose_pivot_frame(image_a, warped_b, t=2.0), warped_b
+    )
+
+
+def test_compose_pivot_frame_rejects_shape_mismatch():
+    a = np.zeros((10, 10), dtype=np.uint8)
+    b = np.zeros((10, 12), dtype=np.uint8)
+    with pytest.raises(ValueError):
+        compose_pivot_frame(a, b, t=0.5)
+
+
+def test_compose_pivot_frame_rejects_non_uint8():
+    a = np.zeros((10, 10), dtype=np.uint8)
+    b = np.zeros((10, 10), dtype=np.uint16)
+    with pytest.raises(ValueError):
+        compose_pivot_frame(a, b, t=0.5)
+
+
+# --------------------------------------------------------------------------
+# format_pivot_honesty — must include inlier count and error verbatim
+# --------------------------------------------------------------------------
+def test_format_pivot_honesty_includes_inlier_count_and_error():
+    text = format_pivot_honesty(inlier_count=42, mean_error_px=1.234)
+    assert "42" in text
+    assert "1.234" in text
+    assert "px" in text
+    assert "parallax" in text.lower()
+    assert "not a stitch" in text.lower()
+
+
+def test_format_pivot_honesty_rounds_error_to_three_decimals():
+    text = format_pivot_honesty(inlier_count=7, mean_error_px=0.1)
+    assert "0.100" in text
 
 
 # --------------------------------------------------------------------------
