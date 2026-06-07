@@ -1,7 +1,8 @@
-"""Minimal PyQt6 desktop GUI for ApexView.
+"""PyQt6 desktop GUI for ApexView with local patient management.
 
 THIN CLIENT. The GUI performs NO image analysis. It calls the existing
-engine + reader and only displays what they already produced:
+engine, readers, and store layer and only displays what they already
+produced:
 
   * :func:`apexview.io.image_reader.load_image` for DICOM / JPEG / PNG
     input, returning a :class:`RadiographImage`.
@@ -15,6 +16,12 @@ engine + reader and only displays what they already produced:
     pairs: a rough overlap registration of two real different-angle
     radiographs so a single pivot viewer can flip between them. This is
     NOT a stitch, NOT an angulation correction, NOT a 3D reconstruction.
+  * :class:`apexview.store.database.Database` for LOCAL persistence of
+    patients, the radiographs they have IMPORTED into the app, and the
+    analyses already run on those radiographs. There is no networking,
+    no cloud sync, and NO live sensor capture: a radiograph enters the
+    app only by importing an existing image file the sensor's own
+    capture software has exported.
 
 Every value shown in the UI is read verbatim from those objects. The GUI
 deliberately does not import cv2: PNG/TIFF/JPEG export of arrays goes
@@ -60,6 +67,13 @@ from apexview.engine.pivot_align import (
 from apexview.io.dicom_reader import RadiographImage
 from apexview.io.image_reader import load_image
 from apexview.io.sensor_info import SensorInfo, read_sensor_info
+from apexview.store.database import (
+    Analysis,
+    Database,
+    Patient,
+    Radiograph,
+    format_analysis_summary,
+)
 
 
 # -- Pure-logic helpers (no Qt; tested headlessly) -----------------------------
@@ -214,19 +228,35 @@ def _array_to_qpixmap(array: np.ndarray):
 class ApexViewWindow:
     """The single application window. Built lazily so import is headless-safe."""
 
-    def __init__(self) -> None:
+    def __init__(self, database: Database | None = None) -> None:
         QtCore, QtGui, QtWidgets = _qt()
         self._QtCore = QtCore
         self._QtGui = QtGui
         self._QtWidgets = QtWidgets
 
+        # Local persistence. Pass a custom Database in tests or scripted
+        # use; otherwise we open the per-user default location.
+        self.db: Database = database if database is not None else Database()
+
+        # Selected-patient state
+        self.current_patient: Patient | None = None
+        self.current_radiographs: list[Radiograph] = []
+        self.current_analyses: list[Analysis] = []
+
+        # Loaded image state for the Analyze flow
         self.image_a: RadiographImage | None = None
         self.image_b: RadiographImage | None = None
-        self.path_a: Path | None = None
-        self.path_b: Path | None = None
+        self.radiograph_a: Radiograph | None = None
+        self.radiograph_b: Radiograph | None = None
+
+        # Analyze result state
         self.last_display: AnalysisDisplay | None = None
         self.current_alignment: PivotAlignment | None = None
         self.current_pivot_frame: np.ndarray | None = None
+        # Row id of the most recently persisted analysis so a follow-up
+        # Save stitched / Save pivot frame call can back-fill its
+        # result_image_path column.
+        self.current_analysis_id: int | None = None
 
         # Image labels whose stored ``_original_pixmap`` should re-fit on
         # window resize. Populated by :meth:`_build_image_display`.
@@ -262,7 +292,7 @@ class ApexViewWindow:
 
         self.window = _ResizingMainWindow()
         self.window.setWindowTitle("ApexView")
-        self.window.resize(960, 760)
+        self.window.resize(1180, 820)
 
         # Scroll area as the central widget so the user can scroll the
         # whole window top-to-bottom. setWidgetResizable lets the inner
@@ -279,13 +309,83 @@ class ApexViewWindow:
 
         central = QtWidgets.QWidget()
         self.scroll_area.setWidget(central)
-        root = QtWidgets.QVBoxLayout(central)
+        top_row = QtWidgets.QHBoxLayout(central)
 
-        # Image-pair panel
+        # -- Left column: patients + history ----------------------------
+        left_column = QtWidgets.QVBoxLayout()
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_holder = QtWidgets.QWidget()
+        left_holder.setLayout(left_column)
+        left_holder.setMinimumWidth(280)
+        left_holder.setMaximumWidth(340)
+        top_row.addWidget(left_holder)
+
+        left_column.addWidget(self._section_label("Patients"))
+        self.patient_list = QtWidgets.QListWidget()
+        self.patient_list.itemSelectionChanged.connect(
+            self._on_patient_selection_changed
+        )
+        left_column.addWidget(self.patient_list, stretch=1)
+
+        patient_button_row = QtWidgets.QHBoxLayout()
+        self.add_patient_button = QtWidgets.QPushButton("Add Patient...")
+        self.add_patient_button.clicked.connect(self._on_add_patient)
+        self.delete_patient_button = QtWidgets.QPushButton("Delete Patient")
+        self.delete_patient_button.setEnabled(False)
+        self.delete_patient_button.clicked.connect(self._on_delete_patient)
+        patient_button_row.addWidget(self.add_patient_button)
+        patient_button_row.addWidget(self.delete_patient_button)
+        left_column.addLayout(patient_button_row)
+
+        left_column.addWidget(self._section_label("Analysis history"))
+        self.history_list = QtWidgets.QListWidget()
+        left_column.addWidget(self.history_list, stretch=1)
+
+        # -- Right column: workflow -------------------------------------
+        right_column = QtWidgets.QVBoxLayout()
+        right_column.setContentsMargins(0, 0, 0, 0)
+        right_holder = QtWidgets.QWidget()
+        right_holder.setLayout(right_column)
+        top_row.addWidget(right_holder, stretch=1)
+
+        self.patient_header_label = QtWidgets.QLabel("No patient selected.")
+        header_font = self.patient_header_label.font()
+        header_font.setPointSize(header_font.pointSize() + 4)
+        header_font.setBold(True)
+        self.patient_header_label.setFont(header_font)
+        right_column.addWidget(self.patient_header_label)
+
+        self.patient_details_label = QtWidgets.QLabel("")
+        self.patient_details_label.setWordWrap(True)
+        right_column.addWidget(self.patient_details_label)
+
+        # Radiographs for the selected patient
+        right_column.addWidget(self._section_label("Imported radiographs"))
+        self.radiograph_list = QtWidgets.QListWidget()
+        self.radiograph_list.setMinimumHeight(120)
+        right_column.addWidget(self.radiograph_list)
+
+        radio_button_row = QtWidgets.QHBoxLayout()
+        self.import_button = QtWidgets.QPushButton("Import Radiograph...")
+        self.import_button.setEnabled(False)
+        self.import_button.clicked.connect(self._on_import_radiograph)
+        self.delete_radiograph_button = QtWidgets.QPushButton("Delete Selected Radiograph")
+        self.delete_radiograph_button.setEnabled(False)
+        self.delete_radiograph_button.clicked.connect(self._on_delete_radiograph)
+        radio_button_row.addWidget(self.import_button)
+        radio_button_row.addWidget(self.delete_radiograph_button)
+        radio_button_row.addStretch(1)
+        right_column.addLayout(radio_button_row)
+        self.radiograph_list.itemSelectionChanged.connect(
+            self._on_radiograph_list_selection_changed
+        )
+
+        # Image A/B selection
+        right_column.addWidget(self._section_label("Select images to compare"))
         pair_row = QtWidgets.QHBoxLayout()
-        root.addLayout(pair_row)
-        self._slot_a = self._build_slot("A", self._on_load_a)
-        self._slot_b = self._build_slot("B", self._on_load_b)
+        right_column.addLayout(pair_row)
+        self._slot_a = self._build_slot("A")
+        self._slot_b = self._build_slot("B")
         pair_row.addLayout(self._slot_a["layout"])
         pair_row.addLayout(self._slot_b["layout"])
 
@@ -293,7 +393,7 @@ class ApexViewWindow:
         self.analyze_button = QtWidgets.QPushButton("Analyze")
         self.analyze_button.setEnabled(False)
         self.analyze_button.clicked.connect(self._on_analyze)
-        root.addWidget(self.analyze_button)
+        right_column.addWidget(self.analyze_button)
 
         # Results panel — text rows stay compact at the top of the scroll.
         self.verdict_label = QtWidgets.QLabel("")
@@ -305,17 +405,20 @@ class ApexViewWindow:
         self.reproj_label = QtWidgets.QLabel("")
         self.message_label = QtWidgets.QLabel("")
         self.message_label.setWordWrap(True)
-        for w in (self.verdict_label, self.inlier_label, self.reproj_label, self.message_label):
-            root.addWidget(w)
+        for w in (
+            self.verdict_label, self.inlier_label,
+            self.reproj_label, self.message_label,
+        ):
+            right_column.addWidget(w)
 
         # Stitched-image preview + save (EXTENSION pairs)
         self.stitched_label = self._build_image_display(min_height=320)
-        root.addWidget(self.stitched_label, stretch=2)
+        right_column.addWidget(self.stitched_label, stretch=2)
 
         self.save_button = QtWidgets.QPushButton("Save stitched radiograph...")
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._on_save)
-        root.addWidget(self.save_button)
+        right_column.addWidget(self.save_button)
 
         # Pivot viewer (ANGULATION pairs) -----------------------------------
         # Hidden by default. After Analyze on an ANGULATION pair we either
@@ -348,7 +451,7 @@ class ApexViewWindow:
         pivot_layout.addWidget(self.pivot_save_button)
 
         self.pivot_container.setVisible(False)
-        root.addWidget(self.pivot_container, stretch=3)
+        right_column.addWidget(self.pivot_container, stretch=3)
 
         # Fallback side-by-side (ANGULATION pair when alignment refuses) ----
         self.pivot_fallback_container = QtWidgets.QWidget()
@@ -364,11 +467,25 @@ class ApexViewWindow:
         self.pivot_fallback_message.setWordWrap(True)
         fallback_layout.addWidget(self.pivot_fallback_message)
         self.pivot_fallback_container.setVisible(False)
-        root.addWidget(self.pivot_fallback_container, stretch=2)
+        right_column.addWidget(self.pivot_fallback_container, stretch=2)
 
         # Status line
-        self.status_label = QtWidgets.QLabel("Ready.")
-        root.addWidget(self.status_label)
+        self.status_label = QtWidgets.QLabel(
+            "Ready. Add or select a patient to begin."
+        )
+        right_column.addWidget(self.status_label)
+
+        # Initial population from disk.
+        self._refresh_patient_list()
+
+    # -- section header helper ----------------------------------------------
+    def _section_label(self, text: str):
+        QtWidgets = self._QtWidgets
+        label = QtWidgets.QLabel(text)
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        return label
 
     # -- image-display helpers ----------------------------------------------
     def _build_image_display(self, min_height: int = 250):
@@ -432,13 +549,16 @@ class ApexViewWindow:
         self._refit_all_image_labels()
 
     # -- slot factory --------------------------------------------------------
-    def _build_slot(self, label: str, on_click: Callable[[], None]) -> dict:
+    def _build_slot(self, label: str) -> dict:
         _QtCore, _QtGui, QtWidgets = self._QtCore, self._QtGui, self._QtWidgets
         layout = QtWidgets.QVBoxLayout()
-        button = QtWidgets.QPushButton(f"Load Image {label}")
-        button.clicked.connect(on_click)
-        layout.addWidget(button)
-        name = QtWidgets.QLabel("(no file)")
+        layout.addWidget(QtWidgets.QLabel(f"Image {label}"))
+        combo = QtWidgets.QComboBox()
+        combo.currentIndexChanged.connect(
+            lambda _index, slot=label: self._on_slot_combo_changed(slot)
+        )
+        layout.addWidget(combo)
+        name = QtWidgets.QLabel("(no image selected)")
         name.setWordWrap(True)
         layout.addWidget(name)
         spacing = QtWidgets.QLabel("")
@@ -450,61 +570,381 @@ class ApexViewWindow:
         preview = self._build_image_display(min_height=260)
         layout.addWidget(preview, stretch=1)
         return {
-            "layout": layout, "button": button,
+            "layout": layout, "combo": combo,
             "name": name, "spacing": spacing, "sensor": sensor, "preview": preview,
         }
 
-    # -- handlers ------------------------------------------------------------
-    def _on_load_a(self) -> None:
-        self._load_into("A")
+    # -- patient list management --------------------------------------------
+    def _refresh_patient_list(self, select_patient_id: int | None = None) -> None:
+        self.patient_list.blockSignals(True)
+        self.patient_list.clear()
+        patients = self.db.list_patients()
+        row_to_select = -1
+        for i, patient in enumerate(patients):
+            item = self._QtWidgets.QListWidgetItem(patient.name)
+            item.setData(self._QtCore.Qt.ItemDataRole.UserRole, patient.id)
+            self.patient_list.addItem(item)
+            if patient.id == select_patient_id:
+                row_to_select = i
+        self.patient_list.blockSignals(False)
+        if row_to_select >= 0:
+            self.patient_list.setCurrentRow(row_to_select)
+        else:
+            self._on_patient_selection_changed()
 
-    def _on_load_b(self) -> None:
-        self._load_into("B")
+    def _selected_patient_id(self) -> int | None:
+        item = self.patient_list.currentItem()
+        if item is None:
+            return None
+        value = item.data(self._QtCore.Qt.ItemDataRole.UserRole)
+        return int(value) if value is not None else None
 
-    def _load_into(self, slot: str) -> None:
+    def _on_patient_selection_changed(self) -> None:
+        pid = self._selected_patient_id()
+        if pid is None:
+            self.current_patient = None
+            self.current_radiographs = []
+            self.current_analyses = []
+            self.patient_header_label.setText("No patient selected.")
+            self.patient_details_label.setText("")
+            self.radiograph_list.clear()
+            self.history_list.clear()
+            self.delete_patient_button.setEnabled(False)
+            self.import_button.setEnabled(False)
+            self.delete_radiograph_button.setEnabled(False)
+            self._populate_slot_combos()
+            self._refresh_analyze_button()
+            return
+
+        self.current_patient = self.db.get_patient(pid)
+        if self.current_patient is None:
+            self._show_error(f"Patient {pid} is no longer in the database.")
+            self._refresh_patient_list()
+            return
+
+        self.patient_header_label.setText(f"Patient: {self.current_patient.name}")
+        bits: list[str] = []
+        if self.current_patient.date_of_birth:
+            bits.append(f"DOB: {self.current_patient.date_of_birth}")
+        if self.current_patient.notes:
+            bits.append(self.current_patient.notes)
+        self.patient_details_label.setText("  |  ".join(bits))
+
+        self.delete_patient_button.setEnabled(True)
+        self.import_button.setEnabled(True)
+
+        # Reset Analyze-pane state for the new patient.
+        self.image_a = None
+        self.image_b = None
+        self.radiograph_a = None
+        self.radiograph_b = None
+        self._reset_slot(self._slot_a)
+        self._reset_slot(self._slot_b)
+        self._reset_results_panel()
+
+        self._refresh_radiograph_list()
+        self._refresh_history_list()
+        self._refresh_analyze_button()
+        self.status_label.setText(
+            f"Selected patient: {self.current_patient.name}."
+        )
+
+    def _refresh_radiograph_list(self) -> None:
+        self.radiograph_list.clear()
+        self.current_radiographs = []
+        if self.current_patient is None:
+            self._populate_slot_combos()
+            return
+        radios = self.db.list_radiographs(self.current_patient.id)
+        self.current_radiographs = radios
+        for radio in radios:
+            text = radio.original_filename or Path(radio.stored_path).name
+            if radio.sensor_summary:
+                text += f"\n  {radio.sensor_summary}"
+            item = self._QtWidgets.QListWidgetItem(text)
+            item.setData(self._QtCore.Qt.ItemDataRole.UserRole, radio.id)
+            self.radiograph_list.addItem(item)
+        self._populate_slot_combos()
+        self.delete_radiograph_button.setEnabled(False)
+
+    def _on_radiograph_list_selection_changed(self) -> None:
+        self.delete_radiograph_button.setEnabled(
+            self.radiograph_list.currentItem() is not None
+        )
+
+    def _populate_slot_combos(self) -> None:
+        for slot in (self._slot_a, self._slot_b):
+            combo = slot["combo"]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(select)", None)
+            for radio in self.current_radiographs:
+                label = radio.original_filename or Path(radio.stored_path).name
+                combo.addItem(label, radio.id)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+
+    def _refresh_history_list(self) -> None:
+        self.history_list.clear()
+        self.current_analyses = []
+        if self.current_patient is None:
+            return
+        analyses = self.db.list_analyses(self.current_patient.id)
+        self.current_analyses = analyses
+        radio_by_id = {r.id: r for r in self.current_radiographs}
+        for analysis in analyses:
+            radio_a = radio_by_id.get(analysis.radiograph_a_id or -1)
+            radio_b = radio_by_id.get(analysis.radiograph_b_id or -1)
+            name_a = radio_a.original_filename if radio_a else None
+            name_b = radio_b.original_filename if radio_b else None
+            text = format_analysis_summary(analysis, name_a=name_a, name_b=name_b)
+            self.history_list.addItem(text)
+
+    def _reset_slot(self, slot: dict) -> None:
+        slot["combo"].blockSignals(True)
+        slot["combo"].setCurrentIndex(0)
+        slot["combo"].blockSignals(False)
+        slot["name"].setText("(no image selected)")
+        slot["spacing"].setText("")
+        slot["sensor"].setText("")
+        self._clear_image_label(slot["preview"])
+
+    def _reset_results_panel(self) -> None:
+        self.last_display = None
+        self.current_alignment = None
+        self.current_pivot_frame = None
+        self.current_analysis_id = None
+        self.verdict_label.setText("")
+        self.inlier_label.setText("")
+        self.reproj_label.setText("")
+        self.message_label.setText("")
+        self._clear_image_label(self.stitched_label)
+        self._clear_image_label(self.pivot_image_label)
+        self._clear_image_label(self.pivot_fallback_label_a)
+        self._clear_image_label(self.pivot_fallback_label_b)
+        self.pivot_honesty_label.setText("")
+        self.pivot_fallback_message.setText("")
+        self.save_button.setEnabled(False)
+        self.pivot_save_button.setEnabled(False)
+        self.pivot_container.setVisible(False)
+        self.pivot_fallback_container.setVisible(False)
+
+    def _refresh_analyze_button(self) -> None:
+        ready = (
+            self.current_patient is not None
+            and self.image_a is not None
+            and self.image_b is not None
+        )
+        self.analyze_button.setEnabled(ready)
+
+    # -- patient actions ----------------------------------------------------
+    def _on_add_patient(self) -> None:
+        result = self._prompt_new_patient()
+        if result is None:
+            return
+        name, dob, notes = result
+        try:
+            patient = self.db.add_patient(name, date_of_birth=dob, notes=notes)
+        except ValueError as exc:
+            self._show_error(f"Could not add patient: {exc}")
+            return
+        except Exception as exc:
+            self._show_error(f"Unexpected error adding patient: {exc}")
+            return
+        self._refresh_patient_list(select_patient_id=patient.id)
+        self.status_label.setText(f"Added patient: {patient.name}.")
+
+    def _prompt_new_patient(self) -> tuple[str, str | None, str | None] | None:
+        QtWidgets = self._QtWidgets
+        dialog = QtWidgets.QDialog(self.window)
+        dialog.setWindowTitle("Add Patient")
+        layout = QtWidgets.QFormLayout(dialog)
+        name_edit = QtWidgets.QLineEdit()
+        dob_edit = QtWidgets.QLineEdit()
+        dob_edit.setPlaceholderText("YYYY-MM-DD (optional)")
+        notes_edit = QtWidgets.QPlainTextEdit()
+        notes_edit.setPlaceholderText("Notes (optional)")
+        notes_edit.setFixedHeight(80)
+        layout.addRow("Name *:", name_edit)
+        layout.addRow("DOB:", dob_edit)
+        layout.addRow("Notes:", notes_edit)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        name = name_edit.text().strip()
+        if not name:
+            self._show_error("Patient name is required.")
+            return None
+        dob = dob_edit.text().strip() or None
+        notes = notes_edit.toPlainText().strip() or None
+        return (name, dob, notes)
+
+    def _on_delete_patient(self) -> None:
+        if self.current_patient is None:
+            return
+        QtWidgets = self._QtWidgets
+        answer = QtWidgets.QMessageBox.question(
+            self.window,
+            "Delete patient",
+            (
+                f"Delete patient '{self.current_patient.name}' and all "
+                f"their imported radiographs and saved analyses? This "
+                f"removes the stored files from disk and cannot be undone."
+            ),
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        deleted_name = self.current_patient.name
+        try:
+            self.db.delete_patient(self.current_patient.id)
+        except Exception as exc:
+            self._show_error(f"Could not delete patient: {exc}")
+            return
+        self.current_patient = None
+        self._refresh_patient_list()
+        self.status_label.setText(f"Deleted patient: {deleted_name}.")
+
+    # -- radiograph actions -------------------------------------------------
+    def _on_import_radiograph(self) -> None:
+        if self.current_patient is None:
+            self._show_error("Select a patient before importing a radiograph.")
+            return
         QtWidgets = self._QtWidgets
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self.window, f"Select image {slot}", "", SUPPORTED_FILE_FILTER,
+            self.window, "Import radiograph", "", SUPPORTED_FILE_FILTER,
         )
         if not path:
             return
         try:
-            image = load_image(path)
-        except (FileNotFoundError, ValueError) as exc:
-            self._show_error(f"Could not load image {slot}: {exc}")
+            radio = self.db.import_radiograph(self.current_patient.id, path)
+        except FileNotFoundError as exc:
+            self._show_error(f"Could not import radiograph: {exc}")
             return
-        ui = self._slot_a if slot == "A" else self._slot_b
-        ui["name"].setText(Path(path).name)
-        ui["spacing"].setText(format_pixel_spacing(image))
-        try:
-            sensor = read_sensor_info(path)
-            ui["sensor"].setText(sensor.summary)
+        except ValueError as exc:
+            self._show_error(f"Could not import radiograph: {exc}")
+            return
         except Exception as exc:
-            ui["sensor"].setText(f"Sensor info unavailable: {exc}")
+            self._show_error(f"Unexpected error importing radiograph: {exc}")
+            return
+        self._refresh_radiograph_list()
+        self.status_label.setText(
+            f"Imported {radio.original_filename} for "
+            f"{self.current_patient.name}."
+        )
+
+    def _on_delete_radiograph(self) -> None:
+        item = self.radiograph_list.currentItem()
+        if item is None or self.current_patient is None:
+            return
+        radio_id = item.data(self._QtCore.Qt.ItemDataRole.UserRole)
+        QtWidgets = self._QtWidgets
+        answer = QtWidgets.QMessageBox.question(
+            self.window,
+            "Delete radiograph",
+            (
+                "Delete the selected radiograph for this patient? The "
+                "stored copy will be removed from disk; the original on "
+                "your computer is untouched."
+            ),
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
         try:
-            self._set_image_label(ui["preview"], image.pixels_u8)
+            self.db.delete_radiograph(int(radio_id))
         except Exception as exc:
-            self._show_error(f"Could not render preview for {slot}: {exc}")
-        if slot == "A":
+            self._show_error(f"Could not delete radiograph: {exc}")
+            return
+        # Anything previously loaded that pointed at this radiograph is
+        # now stale; reset the Analyze pane defensively.
+        self.image_a = None
+        self.image_b = None
+        self.radiograph_a = None
+        self.radiograph_b = None
+        self._reset_slot(self._slot_a)
+        self._reset_slot(self._slot_b)
+        self._reset_results_panel()
+        self._refresh_radiograph_list()
+        self._refresh_history_list()
+        self._refresh_analyze_button()
+        self.status_label.setText("Radiograph deleted.")
+
+    # -- image selection ----------------------------------------------------
+    def _on_slot_combo_changed(self, slot_name: str) -> None:
+        slot = self._slot_a if slot_name == "A" else self._slot_b
+        combo = slot["combo"]
+        radio_id = combo.currentData()
+        if radio_id is None:
+            self._reset_slot(slot)
+            if slot_name == "A":
+                self.image_a = None
+                self.radiograph_a = None
+            else:
+                self.image_b = None
+                self.radiograph_b = None
+            self._refresh_analyze_button()
+            return
+        radio = self.db.get_radiograph(int(radio_id))
+        if radio is None:
+            self._show_error(
+                f"Radiograph {radio_id} is no longer in the database."
+            )
+            self._reset_slot(slot)
+            self._refresh_radiograph_list()
+            return
+        try:
+            image = load_image(radio.stored_path)
+        except (FileNotFoundError, ValueError) as exc:
+            self._show_error(
+                f"Could not load image {slot_name}: {exc}"
+            )
+            self._reset_slot(slot)
+            return
+        slot["name"].setText(
+            radio.original_filename or Path(radio.stored_path).name
+        )
+        slot["spacing"].setText(format_pixel_spacing(image))
+        slot["sensor"].setText(radio.sensor_summary or "Sensor info unavailable.")
+        try:
+            self._set_image_label(slot["preview"], image.pixels_u8)
+        except Exception as exc:
+            self._show_error(
+                f"Could not render preview for {slot_name}: {exc}"
+            )
+        if slot_name == "A":
             self.image_a = image
-            self.path_a = Path(path)
+            self.radiograph_a = radio
         else:
             self.image_b = image
-            self.path_b = Path(path)
-        self.analyze_button.setEnabled(
-            self.image_a is not None and self.image_b is not None
-        )
-        self.status_label.setText(f"Loaded image {slot}.")
+            self.radiograph_b = radio
+        self._refresh_analyze_button()
+        self.status_label.setText(f"Loaded image {slot_name}.")
 
+    # -- analyze ------------------------------------------------------------
     def _on_analyze(self) -> None:
-        if self.image_a is None or self.image_b is None:
+        if (
+            self.current_patient is None
+            or self.image_a is None
+            or self.image_b is None
+        ):
             return
         try:
             result = classify_pair(self.image_a.pixels_u8, self.image_b.pixels_u8)
         except ValueError as exc:
             self._show_error(f"Engine rejected the inputs: {exc}")
             return
-        except Exception as exc:  # surface unexpected engine failures cleanly
+        except Exception as exc:
             self._show_error(f"Unexpected engine error: {exc}")
             return
 
@@ -539,6 +979,23 @@ class ApexViewWindow:
 
         if result.pair_type is PairType.ANGULATION:
             self._present_pivot()
+
+        # Persist the analysis exactly as the engine reported it. NaN
+        # reprojection error is normalized to NULL inside save_analysis.
+        try:
+            saved = self.db.save_analysis(
+                patient_id=self.current_patient.id,
+                radiograph_a_id=self.radiograph_a.id if self.radiograph_a else None,
+                radiograph_b_id=self.radiograph_b.id if self.radiograph_b else None,
+                verdict=display.verdict_label,
+                inlier_count=int(result.inlier_count),
+                mean_reproj_error=float(result.mean_reprojection_error),
+                message=result.message,
+            )
+            self.current_analysis_id = saved.id
+            self._refresh_history_list()
+        except Exception as exc:
+            self._show_error(f"Analysis ran but could not be saved: {exc}")
 
         # Defer one round-trip so any panels we just made visible have had
         # a chance to lay out before we ask their image labels to re-fit.
@@ -628,6 +1085,7 @@ class ApexViewWindow:
         new_value = 0 if self.pivot_slider.value() >= 50 else 100
         self.pivot_slider.setValue(new_value)
 
+    # -- save handlers ------------------------------------------------------
     def _on_save(self) -> None:
         QtWidgets = self._QtWidgets
         if self.last_display is None or self.last_display.stitched_image is None:
@@ -642,6 +1100,17 @@ class ApexViewWindow:
         except Exception as exc:
             self._show_error(f"Could not save image: {exc}")
             return
+        if self.current_analysis_id is not None:
+            try:
+                self.db.set_analysis_result_path(
+                    self.current_analysis_id, path
+                )
+                self._refresh_history_list()
+            except Exception as exc:
+                self._show_error(
+                    f"Saved image but could not record path in database: {exc}"
+                )
+                return
         self.status_label.setText(f"Saved stitched image to {path}.")
 
     def _on_pivot_save(self) -> None:
@@ -658,6 +1127,17 @@ class ApexViewWindow:
         except Exception as exc:
             self._show_error(f"Could not save pivot frame: {exc}")
             return
+        if self.current_analysis_id is not None:
+            try:
+                self.db.set_analysis_result_path(
+                    self.current_analysis_id, path
+                )
+                self._refresh_history_list()
+            except Exception as exc:
+                self._show_error(
+                    f"Saved frame but could not record path in database: {exc}"
+                )
+                return
         self.status_label.setText(f"Saved pivot frame to {path}.")
 
     def _show_error(self, message: str) -> None:
