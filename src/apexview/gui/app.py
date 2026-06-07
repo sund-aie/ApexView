@@ -22,6 +22,13 @@ through Pillow, and the pivot viewer's blend between image_a and
 warped_b is pure numpy arithmetic on engine-produced arrays (display
 math only; no analysis).
 
+Layout: the whole window is hosted inside a :class:`QScrollArea` so the
+content is scrollable when it exceeds the viewport, and image displays
+scale to the available panel size while preserving aspect ratio. Each
+image label keeps its full-resolution :class:`QPixmap` and re-fits on
+resize, so the previews and the pivot frame stay legible at any window
+size.
+
 Structure: presentation logic (string formatting, button-enable rules,
 the pivot blend) is factored into pure functions and dataclasses below so
 the unit tests can exercise them HEADLESS, without constructing a
@@ -183,9 +190,15 @@ def _qt():
     return QtCore, QtGui, QtWidgets
 
 
-def _array_to_qpixmap(array: np.ndarray, max_size: int = 320):
-    """Wrap a uint8 2D grayscale numpy array as a QPixmap, scaled to fit."""
-    QtCore, QtGui, _ = _qt()
+def _array_to_qpixmap(array: np.ndarray):
+    """Wrap a uint8 2D grayscale numpy array as a full-resolution QPixmap.
+
+    Scaling for display is done by
+    :meth:`ApexViewWindow._fit_label_pixmap` against the live label
+    geometry, so this helper returns the engine pixels at their native
+    size and leaves layout decisions to the window.
+    """
+    _QtCore, QtGui, _QtWidgets = _qt()
     if array.dtype != np.uint8 or array.ndim != 2:
         raise ValueError("preview requires a 2D uint8 array")
     h, w = array.shape
@@ -195,12 +208,7 @@ def _array_to_qpixmap(array: np.ndarray, max_size: int = 320):
         contiguous.data, w, h, contiguous.strides[0],
         QtGui.QImage.Format.Format_Grayscale8,
     ).copy()  # copy detaches from the numpy buffer
-    pix = QtGui.QPixmap.fromImage(qimg)
-    return pix.scaled(
-        max_size, max_size,
-        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-        QtCore.Qt.TransformationMode.SmoothTransformation,
-    )
+    return QtGui.QPixmap.fromImage(qimg)
 
 
 class ApexViewWindow:
@@ -220,12 +228,57 @@ class ApexViewWindow:
         self.current_alignment: PivotAlignment | None = None
         self.current_pivot_frame: np.ndarray | None = None
 
-        self.window = QtWidgets.QMainWindow()
+        # Image labels whose stored ``_original_pixmap`` should re-fit on
+        # window resize. Populated by :meth:`_build_image_display`.
+        self._image_labels: list = []
+
+        owner = self
+
+        class _ResizingMainWindow(QtWidgets.QMainWindow):
+            """QMainWindow subclass that re-fits image pixmaps on resize.
+
+            Defined inside ``__init__`` to keep the lazy-Qt import pattern
+            intact: nothing at module-import time touches PyQt6.
+            """
+
+            def resizeEvent(inner_self, event):  # noqa: N805
+                super().resizeEvent(event)
+                owner._on_window_resized()
+
+        class _AutoFitLabel(QtWidgets.QLabel):
+            """QLabel that asks the owning window to re-fit its pixmap.
+
+            Fires on every layout-driven size change (panel toggles,
+            window resize, splitter drags) so the displayed pixmap always
+            matches the label's current geometry.
+            """
+
+            def resizeEvent(inner_self, event):  # noqa: N805
+                super().resizeEvent(event)
+                owner._fit_label_pixmap(inner_self)
+
+        self._ResizingMainWindow = _ResizingMainWindow
+        self._AutoFitLabel = _AutoFitLabel
+
+        self.window = _ResizingMainWindow()
         self.window.setWindowTitle("ApexView")
-        self.window.resize(900, 700)
+        self.window.resize(960, 760)
+
+        # Scroll area as the central widget so the user can scroll the
+        # whole window top-to-bottom. setWidgetResizable lets the inner
+        # content widget grow horizontally with the viewport.
+        self.scroll_area = QtWidgets.QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.scroll_area.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.window.setCentralWidget(self.scroll_area)
 
         central = QtWidgets.QWidget()
-        self.window.setCentralWidget(central)
+        self.scroll_area.setWidget(central)
         root = QtWidgets.QVBoxLayout(central)
 
         # Image-pair panel
@@ -242,7 +295,7 @@ class ApexViewWindow:
         self.analyze_button.clicked.connect(self._on_analyze)
         root.addWidget(self.analyze_button)
 
-        # Results panel
+        # Results panel — text rows stay compact at the top of the scroll.
         self.verdict_label = QtWidgets.QLabel("")
         verdict_font = self.verdict_label.font()
         verdict_font.setPointSize(verdict_font.pointSize() + 6)
@@ -256,10 +309,8 @@ class ApexViewWindow:
             root.addWidget(w)
 
         # Stitched-image preview + save (EXTENSION pairs)
-        self.stitched_label = QtWidgets.QLabel("")
-        self.stitched_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.stitched_label.setMinimumHeight(200)
-        root.addWidget(self.stitched_label, stretch=1)
+        self.stitched_label = self._build_image_display(min_height=320)
+        root.addWidget(self.stitched_label, stretch=2)
 
         self.save_button = QtWidgets.QPushButton("Save stitched radiograph...")
         self.save_button.setEnabled(False)
@@ -273,9 +324,7 @@ class ApexViewWindow:
         self.pivot_container = QtWidgets.QWidget()
         pivot_layout = QtWidgets.QVBoxLayout(self.pivot_container)
         pivot_layout.setContentsMargins(0, 0, 0, 0)
-        self.pivot_image_label = QtWidgets.QLabel("")
-        self.pivot_image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.pivot_image_label.setMinimumHeight(200)
+        self.pivot_image_label = self._build_image_display(min_height=360)
         pivot_layout.addWidget(self.pivot_image_label, stretch=1)
 
         self.pivot_honesty_label = QtWidgets.QLabel("")
@@ -299,19 +348,15 @@ class ApexViewWindow:
         pivot_layout.addWidget(self.pivot_save_button)
 
         self.pivot_container.setVisible(False)
-        root.addWidget(self.pivot_container, stretch=1)
+        root.addWidget(self.pivot_container, stretch=3)
 
         # Fallback side-by-side (ANGULATION pair when alignment refuses) ----
         self.pivot_fallback_container = QtWidgets.QWidget()
         fallback_layout = QtWidgets.QVBoxLayout(self.pivot_fallback_container)
         fallback_layout.setContentsMargins(0, 0, 0, 0)
         fallback_row = QtWidgets.QHBoxLayout()
-        self.pivot_fallback_label_a = QtWidgets.QLabel("")
-        self.pivot_fallback_label_a.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.pivot_fallback_label_a.setMinimumHeight(200)
-        self.pivot_fallback_label_b = QtWidgets.QLabel("")
-        self.pivot_fallback_label_b.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.pivot_fallback_label_b.setMinimumHeight(200)
+        self.pivot_fallback_label_a = self._build_image_display(min_height=280)
+        self.pivot_fallback_label_b = self._build_image_display(min_height=280)
         fallback_row.addWidget(self.pivot_fallback_label_a, stretch=1)
         fallback_row.addWidget(self.pivot_fallback_label_b, stretch=1)
         fallback_layout.addLayout(fallback_row)
@@ -319,15 +364,76 @@ class ApexViewWindow:
         self.pivot_fallback_message.setWordWrap(True)
         fallback_layout.addWidget(self.pivot_fallback_message)
         self.pivot_fallback_container.setVisible(False)
-        root.addWidget(self.pivot_fallback_container, stretch=1)
+        root.addWidget(self.pivot_fallback_container, stretch=2)
 
         # Status line
         self.status_label = QtWidgets.QLabel("Ready.")
         root.addWidget(self.status_label)
 
+    # -- image-display helpers ----------------------------------------------
+    def _build_image_display(self, min_height: int = 250):
+        """Construct an :class:`_AutoFitLabel` for an image panel.
+
+        The label uses an expanding size policy so it grows when the window
+        does, but enforces a minimum height so even on small windows the
+        image is at least legible (the user scrolls if total content
+        exceeds the viewport).
+        """
+        QtCore, _QtGui, QtWidgets = self._QtCore, self._QtGui, self._QtWidgets
+        label = self._AutoFitLabel("")
+        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumHeight(min_height)
+        label.setMinimumWidth(240)
+        label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        label._original_pixmap = None
+        self._image_labels.append(label)
+        return label
+
+    def _set_image_label(self, label, array: np.ndarray) -> None:
+        """Store the engine array as a full-resolution pixmap on ``label``
+        and scale it to the label's current geometry."""
+        pixmap = _array_to_qpixmap(array)
+        label._original_pixmap = pixmap
+        self._fit_label_pixmap(label)
+
+    def _clear_image_label(self, label) -> None:
+        label._original_pixmap = None
+        label.clear()
+
+    def _fit_label_pixmap(self, label) -> None:
+        """Re-scale the label's stored full-resolution pixmap to fit.
+
+        Uses ``KeepAspectRatio`` and ``SmoothTransformation`` so we never
+        distort the radiograph. Bounded by both the current width and
+        height (falling back to minimums when the layout has not yet
+        settled) so a wide image does not bleed past a short panel.
+        """
+        pixmap = getattr(label, "_original_pixmap", None)
+        if pixmap is None or pixmap.isNull():
+            return
+        QtCore = self._QtCore
+        target_w = max(label.width(), label.minimumWidth(), 1)
+        target_h = max(label.height(), label.minimumHeight(), 1)
+        scaled = pixmap.scaled(
+            target_w, target_h,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        label.setPixmap(scaled)
+
+    def _refit_all_image_labels(self) -> None:
+        for label in self._image_labels:
+            self._fit_label_pixmap(label)
+
+    def _on_window_resized(self) -> None:
+        self._refit_all_image_labels()
+
     # -- slot factory --------------------------------------------------------
     def _build_slot(self, label: str, on_click: Callable[[], None]) -> dict:
-        QtCore, _QtGui, QtWidgets = self._QtCore, self._QtGui, self._QtWidgets
+        _QtCore, _QtGui, QtWidgets = self._QtCore, self._QtGui, self._QtWidgets
         layout = QtWidgets.QVBoxLayout()
         button = QtWidgets.QPushButton(f"Load Image {label}")
         button.clicked.connect(on_click)
@@ -341,10 +447,8 @@ class ApexViewWindow:
         sensor = QtWidgets.QLabel("")
         sensor.setWordWrap(True)
         layout.addWidget(sensor)
-        preview = QtWidgets.QLabel("")
-        preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        preview.setMinimumSize(320, 240)
-        layout.addWidget(preview)
+        preview = self._build_image_display(min_height=260)
+        layout.addWidget(preview, stretch=1)
         return {
             "layout": layout, "button": button,
             "name": name, "spacing": spacing, "sensor": sensor, "preview": preview,
@@ -378,7 +482,7 @@ class ApexViewWindow:
         except Exception as exc:
             ui["sensor"].setText(f"Sensor info unavailable: {exc}")
         try:
-            ui["preview"].setPixmap(_array_to_qpixmap(image.pixels_u8))
+            self._set_image_label(ui["preview"], image.pixels_u8)
         except Exception as exc:
             self._show_error(f"Could not render preview for {slot}: {exc}")
         if slot == "A":
@@ -414,9 +518,9 @@ class ApexViewWindow:
         # Reset any prior pivot state; the branch below repopulates it.
         self.current_alignment = None
         self.current_pivot_frame = None
-        self.pivot_image_label.clear()
-        self.pivot_fallback_label_a.clear()
-        self.pivot_fallback_label_b.clear()
+        self._clear_image_label(self.pivot_image_label)
+        self._clear_image_label(self.pivot_fallback_label_a)
+        self._clear_image_label(self.pivot_fallback_label_b)
         self.pivot_honesty_label.setText("")
         self.pivot_fallback_message.setText("")
         self.pivot_save_button.setEnabled(False)
@@ -425,18 +529,20 @@ class ApexViewWindow:
 
         if display.has_stitched_image and display.stitched_image is not None:
             try:
-                self.stitched_label.setPixmap(
-                    _array_to_qpixmap(display.stitched_image, max_size=720)
-                )
+                self._set_image_label(self.stitched_label, display.stitched_image)
             except Exception as exc:
                 self._show_error(f"Could not render stitched preview: {exc}")
-                self.stitched_label.clear()
+                self._clear_image_label(self.stitched_label)
         else:
-            self.stitched_label.clear()
+            self._clear_image_label(self.stitched_label)
         self.save_button.setEnabled(display.save_enabled)
 
         if result.pair_type is PairType.ANGULATION:
             self._present_pivot()
+
+        # Defer one round-trip so any panels we just made visible have had
+        # a chance to lay out before we ask their image labels to re-fit.
+        self._QtCore.QTimer.singleShot(0, self._refit_all_image_labels)
         self.status_label.setText("Analysis complete.")
 
     def _present_pivot(self) -> None:
@@ -457,11 +563,11 @@ class ApexViewWindow:
         except PivotAlignmentError as exc:
             self.pivot_fallback_container.setVisible(True)
             try:
-                self.pivot_fallback_label_a.setPixmap(
-                    _array_to_qpixmap(self.image_a.pixels_u8, max_size=360)
+                self._set_image_label(
+                    self.pivot_fallback_label_a, self.image_a.pixels_u8
                 )
-                self.pivot_fallback_label_b.setPixmap(
-                    _array_to_qpixmap(self.image_b.pixels_u8, max_size=360)
+                self._set_image_label(
+                    self.pivot_fallback_label_b, self.image_b.pixels_u8
                 )
             except Exception as render_exc:
                 self.pivot_fallback_message.setText(
@@ -509,9 +615,7 @@ class ApexViewWindow:
             return
         self.current_pivot_frame = frame
         try:
-            self.pivot_image_label.setPixmap(
-                _array_to_qpixmap(frame, max_size=720)
-            )
+            self._set_image_label(self.pivot_image_label, frame)
         except Exception as exc:
             self._show_error(f"Could not render pivot frame: {exc}")
 
