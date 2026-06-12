@@ -16,6 +16,7 @@ from apexview.engine.pivot_align import (
     PivotAlignment,
     PivotAlignmentError,
     align_for_pivot,
+    validate_alignment_homography,
 )
 
 SEED = 1234
@@ -176,3 +177,140 @@ def test_alignment_is_frozen_dataclass():
     alignment = align_for_pivot(image_a, image_b)
     with pytest.raises(Exception):
         alignment.inlier_count = 0  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# validate_alignment_homography — known-answer on the real-world failure
+# ---------------------------------------------------------------------------
+
+# The exact degenerate homography recovered from a real angulation pair:
+# 16 Lowe matches, only 5 RANSAC inliers, and a fitted matrix whose line at
+# infinity crosses the image (corner homogeneous w values
+# [1.0, -1.89, -2.85, 0.05] — a sign change across the frame), so
+# warpPerspective folded the whole radiograph through a point into a "fan".
+# The source image shape was (356, 481).
+H_FAN = np.array([
+    [-1.73769461e+00, -7.64199657e-01,  2.87719376e+02],
+    [-8.00036351e-01, -3.78610331e-01,  1.35733853e+02],
+    [-6.01600323e-03, -2.68035253e-03,  1.00000000e+00],
+])
+H_FAN_SHAPE = (356, 481)
+
+
+def test_validator_rejects_real_world_fan_matrix():
+    ok, reason = validate_alignment_homography(H_FAN, H_FAN_SHAPE)
+    assert ok is False
+    lowered = reason.lower()
+    assert (
+        "corner" in lowered or "infinity" in lowered or "fold" in lowered
+    ), f"reason must reference the fold/infinity/corner check, got: {reason}"
+
+
+def test_validator_accepts_identity():
+    ok, reason = validate_alignment_homography(np.eye(3), (IMG_H, IMG_W))
+    assert (ok, reason) == (True, "")
+
+
+def test_validator_accepts_mild_rotation_translation():
+    h = _mild_homography(30.0, 5.0, 2.0, (IMG_W / 2.0, IMG_H / 2.0))
+    ok, reason = validate_alignment_homography(h, (IMG_H, IMG_W))
+    assert (ok, reason) == (True, "")
+
+
+def test_validator_rejects_reflection():
+    reflect = np.diag([-1.0, 1.0, 1.0])
+    ok, reason = validate_alignment_homography(reflect, (IMG_H, IMG_W))
+    assert ok is False
+    lowered = reason.lower()
+    assert "reflect" in lowered or "winding" in lowered or "convex" in lowered
+
+
+def test_validator_rejects_extreme_scale():
+    tiny = np.diag([0.01, 0.01, 1.0])
+    ok, reason = validate_alignment_homography(tiny, (IMG_H, IMG_W))
+    assert ok is False
+    assert "area" in reason.lower()
+
+
+def test_validator_rejects_zero_normalization_term():
+    h = np.eye(3)
+    h[2, 2] = 0.0
+    ok, reason = validate_alignment_homography(h, (IMG_H, IMG_W))
+    assert ok is False
+    assert reason  # a real explanation, not an empty string
+
+
+def test_validator_rejects_nan():
+    h = np.eye(3)
+    h[0, 1] = np.nan
+    ok, reason = validate_alignment_homography(h, (IMG_H, IMG_W))
+    assert ok is False
+    assert "finite" in reason.lower() or "nan" in reason.lower()
+
+
+def test_validator_rejects_wrong_shape_matrix():
+    ok, reason = validate_alignment_homography(
+        np.eye(2), (IMG_H, IMG_W)
+    )
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Trust floor and validator wiring inside align_for_pivot (deterministic
+# via monkeypatched cv2.findHomography; two identical textured images feed
+# SIFT plenty of matches so the pipeline reliably reaches RANSAC)
+# ---------------------------------------------------------------------------
+
+
+def test_low_inlier_count_is_refused_even_with_sane_homography(monkeypatch):
+    """5 RANSAC inliers (the real-world garbage case) must be refused even
+    when the fitted matrix itself looks sane: counts near the 4-point
+    existence minimum carry no evidence the alignment is real."""
+    import apexview.engine.pivot_align as pa
+
+    image_a = _make_feature_image()
+    image_b = image_a.copy()
+    sane = _mild_homography(10.0, 2.0, 1.0, (IMG_W / 2.0, IMG_H / 2.0))
+
+    calls: list[int] = []
+
+    def fake_find_homography(src_pts, dst_pts, method, threshold):
+        calls.append(src_pts.shape[0])
+        mask = np.zeros((src_pts.shape[0], 1), dtype=np.uint8)
+        mask[:5] = 1  # exactly 5 inliers out of N
+        return sane, mask
+
+    monkeypatch.setattr(pa.cv2, "findHomography", fake_find_homography)
+
+    with pytest.raises(PivotAlignmentError) as excinfo:
+        align_for_pivot(image_a, image_b)
+
+    assert calls, "findHomography was never reached; pre-fit gate fired instead"
+    message = str(excinfo.value).lower()
+    assert "too few" in message
+    assert "5" in str(excinfo.value)
+
+
+def test_degenerate_homography_with_enough_inliers_is_refused(monkeypatch):
+    """The validator must be wired into align_for_pivot, not just exist:
+    feed RANSAC output that has plenty of inliers but the real-world fan
+    matrix, and the alignment must still be refused."""
+    import apexview.engine.pivot_align as pa
+
+    image_a = _make_feature_image()
+    image_b = image_a.copy()
+
+    calls: list[int] = []
+
+    def fake_find_homography(src_pts, dst_pts, method, threshold):
+        calls.append(src_pts.shape[0])
+        mask = np.ones((src_pts.shape[0], 1), dtype=np.uint8)
+        return H_FAN.copy(), mask
+
+    monkeypatch.setattr(pa.cv2, "findHomography", fake_find_homography)
+
+    with pytest.raises(PivotAlignmentError) as excinfo:
+        align_for_pivot(image_a, image_b)
+
+    assert calls, "findHomography was never reached; pre-fit gate fired instead"
+    assert "trustworthy" in str(excinfo.value).lower()
