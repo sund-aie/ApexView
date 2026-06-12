@@ -1031,9 +1031,10 @@ class ApexViewWindow:
                     f"Could not render fallback preview: {render_exc}"
                 )
                 return
+            # The engine refusal message already ends with its own
+            # side-by-side framing; do not append a second copy.
             message = (
-                f"Could not align this angulation pair for pivot viewing: "
-                f"{exc}. Showing the two images side by side instead."
+                f"Could not align this angulation pair for pivot viewing: {exc}"
             )
             self.pivot_fallback_message.setText(message)
             self._show_error(message)
@@ -1065,7 +1066,7 @@ class ApexViewWindow:
         t = max(0.0, min(1.0, slider_value / 100.0))
         try:
             frame = compose_pivot_frame(
-                alignment.image_a, alignment.warped_b_to_a, t
+                alignment.canvas_a, alignment.canvas_b, t
             )
         except Exception as exc:
             self._show_error(f"Could not compose pivot frame: {exc}")
