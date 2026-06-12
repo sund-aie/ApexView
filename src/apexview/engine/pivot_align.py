@@ -4,11 +4,13 @@ Intra-oral pairs that the classifier flags as ANGULATION are two real
 radiographs of the same teeth taken at different beam angles. No single
 planar warp can stitch them — that's the parallax — and the extension
 stitcher correctly refuses. This module does NOT try to stitch them. It
-fits one homography from the shared anatomy and uses it to project
-``image_b`` into ``image_a``'s pixel grid so a viewer can flip between the
-two real angles with rough overlap. Residual misalignment after the warp
-is the angle difference itself; it is NOT a defect of the alignment and
-must not be claimed as one.
+fits one homography from the shared anatomy and places both radiographs
+on one shared union canvas — sized to the full extent of both images,
+the same corner-union construction the extension stitcher uses for its
+output canvas — so a viewer can flip between the two real angles with
+rough overlap and nothing cropped away. Residual misalignment after the
+warp is the angle difference itself; it is NOT a defect of the alignment
+and must not be claimed as one.
 
 This is NOT a stitch, NOT an angulation correction, NOT a 3D
 reconstruction. It is a comparison-view registration only.
@@ -37,10 +39,11 @@ warped. A refused alignment raises :class:`PivotAlignmentError`; the GUI
 falls back to side-by-side display, which is the correct presentation of
 a pair we cannot trustworthily register.
 
-Single source of truth: ``warped_b_to_a``, ``inlier_count``, and
-``mean_alignment_error_px`` on :class:`PivotAlignment` are computed here
-once and returned to callers verbatim. A GUI must not recompute them from
-the image or the homography.
+Single source of truth: ``canvas_a``, ``canvas_b``, ``canvas_offset``,
+``inlier_count``, and ``mean_alignment_error_px`` on
+:class:`PivotAlignment` are computed here once and returned to callers
+verbatim. A GUI must not recompute them from the images or the
+homography.
 """
 
 from __future__ import annotations
@@ -74,6 +77,15 @@ _AREA_RATIO_MAX = 10.0
 _H22_EPS = 1e-8
 _CORNER_W_EPS = 1e-6
 
+# Defensive memory guard for the union canvas. A validator-sane homography
+# (finite, positive corner w, source winding kept, area ratio near 1) can
+# still carry a huge translation, in which case the union bounding box of
+# the two radiographs explodes even though each image alone is small. 16x
+# the larger input area allows any plausible overlap layout (side by side,
+# diagonal, tall) while refusing canvases that would be almost entirely
+# empty black.
+_MAX_CANVAS_AREA_RATIO = 16.0
+
 
 class PivotAlignmentError(Exception):
     """Raised when a trustworthy rough overlap alignment cannot be fit.
@@ -89,8 +101,24 @@ class PivotAlignmentError(Exception):
 
 @dataclass(frozen=True)
 class PivotAlignment:
-    warped_b_to_a: np.ndarray
-    image_a: np.ndarray
+    """Union-canvas pair built for cross-fade comparison display.
+
+    ``canvas_a`` and ``canvas_b`` are the SAME size: the union bounding
+    box of image_a and of image_b mapped through the alignment homography.
+    ``canvas_a`` holds image_a placed unresampled at its offset;
+    ``canvas_b`` holds image_b warped by the translation-compensated
+    homography. Regions covered by neither radiograph are zero (black).
+    At slider 0 a viewer shows A in place, at 1 the warped B in place,
+    and the canvas shows the FULL extent of both — long, wide, whatever
+    the union is. ``canvas_offset`` is ``(x_min, y_min)`` of the union
+    box expressed in image_a coordinates (image_a sits at row ``-y_min``,
+    col ``-x_min`` of the canvas). ``homography`` is the raw b->a matrix,
+    NOT the translated one used to render ``canvas_b``.
+    """
+
+    canvas_a: np.ndarray
+    canvas_b: np.ndarray
+    canvas_offset: tuple[int, int]
     inlier_count: int
     mean_alignment_error_px: float
     homography: np.ndarray
@@ -203,17 +231,80 @@ def validate_alignment_homography(
     return True, ""
 
 
+def _build_union_canvases(
+    image_a: np.ndarray, image_b: np.ndarray, homography: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    """Build the same-size union-canvas pair for cross-fade display.
+
+    Mirrors the corner-union math of ``extension_stitch._compose``
+    (reimplemented here on purpose — extension_stitch.py is not modified
+    or imported for this): map image_b's corners through the homography,
+    take the union bounding box with image_a's own corners, and render
+    both images into a canvas of that size. image_a is placed by exact
+    slice assignment (no resampling); image_b is warped once by the
+    translation-compensated homography.
+
+    Returns ``(canvas_a, canvas_b, (x_min, y_min))``.
+
+    Raises:
+        PivotAlignmentError: the union canvas would exceed
+            :data:`_MAX_CANVAS_AREA_RATIO` times the larger input area
+            (the pair barely overlaps; a mostly-black giant canvas is not
+            a useful comparison view).
+    """
+    h_a, w_a = image_a.shape
+    h_b, w_b = image_b.shape
+
+    corners_a = np.float32(
+        [[0, 0], [0, h_a], [w_a, h_a], [w_a, 0]]
+    ).reshape(-1, 1, 2)
+    corners_b = np.float32(
+        [[0, 0], [0, h_b], [w_b, h_b], [w_b, 0]]
+    ).reshape(-1, 1, 2)
+    warped_b_corners = cv2.perspectiveTransform(corners_b, homography)
+
+    all_corners = np.concatenate([corners_a, warped_b_corners], axis=0)
+    x_min, y_min = np.floor(all_corners.min(axis=0).ravel()).astype(int)
+    x_max, y_max = np.ceil(all_corners.max(axis=0).ravel()).astype(int)
+
+    canvas_w = int(x_max - x_min)
+    canvas_h = int(y_max - y_min)
+
+    if canvas_h * canvas_w > _MAX_CANVAS_AREA_RATIO * max(h_a * w_a, h_b * w_b):
+        raise PivotAlignmentError(
+            "The two radiographs barely overlap and the combined view "
+            "would be implausibly large - showing the two angles side by "
+            "side instead."
+        )
+
+    translation = np.array(
+        [[1.0, 0.0, -x_min], [0.0, 1.0, -y_min], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+    canvas_a = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    canvas_a[-y_min : -y_min + h_a, -x_min : -x_min + w_a] = image_a
+
+    canvas_b = cv2.warpPerspective(
+        image_b, translation @ homography, (canvas_w, canvas_h)
+    )
+
+    return canvas_a, canvas_b, (int(x_min), int(y_min))
+
+
 def align_for_pivot(image_a: np.ndarray, image_b: np.ndarray) -> PivotAlignment:
     """Roughly register ``image_b`` onto ``image_a`` for comparison viewing.
 
     Both inputs are uint8 2D grayscale arrays. They are passed through
     :func:`preprocess_for_matching` with CLAHE on, then SIFT + Lowe +
-    RANSAC fits a homography mapping ``image_b`` -> ``image_a``. The warp
-    is applied with ``cv2.warpPerspective`` at ``image_a``'s ``(H, W)`` so
-    the result drops into the reference frame without changing canvas
-    size. The returned ``mean_alignment_error_px`` is the mean reprojection
-    error of the RANSAC inliers and is the honesty signal a UI should show
-    alongside the viewer.
+    RANSAC fits a homography mapping ``image_b`` -> ``image_a``. Both
+    images are then rendered onto a shared union canvas sized to the full
+    extent of both (corner union of image_a and the mapped image_b, the
+    same construction the extension stitcher uses), so nothing from
+    either radiograph is cropped away. The returned
+    ``mean_alignment_error_px`` is the mean reprojection error of the
+    RANSAC inliers and is the honesty signal a UI should show alongside
+    the viewer.
 
     This is a comparison-view registration of two different-angle real
     radiographs. Residual misalignment after the warp IS the parallax of
@@ -224,9 +315,11 @@ def align_for_pivot(image_a: np.ndarray, image_b: np.ndarray) -> PivotAlignment:
         ValueError: invalid inputs (non-2D, empty, or mismatched dtypes).
         PivotAlignmentError: not enough matchable features to clear the
             trust floor (:data:`_MIN_ALIGNMENT_INLIERS` Lowe matches before
-            fitting and as many RANSAC inliers after), RANSAC failure, or a
+            fitting and as many RANSAC inliers after), RANSAC failure, a
             fitted homography that fails
-            :func:`validate_alignment_homography` (degenerate geometry).
+            :func:`validate_alignment_homography` (degenerate geometry),
+            or a union canvas exceeding :data:`_MAX_CANVAS_AREA_RATIO`
+            times the larger input (the pair barely overlaps).
     """
     _validate(image_a, image_b)
 
@@ -292,12 +385,14 @@ def align_for_pivot(image_a: np.ndarray, image_b: np.ndarray) -> PivotAlignment:
     errors = np.linalg.norm(projected - dst_inliers, axis=2).ravel()
     mean_alignment_error_px = float(errors.mean())
 
-    h_a, w_a = image_a.shape
-    warped_b_to_a = cv2.warpPerspective(image_b, homography, (w_a, h_a))
+    canvas_a, canvas_b, canvas_offset = _build_union_canvases(
+        image_a, image_b, homography
+    )
 
     return PivotAlignment(
-        warped_b_to_a=warped_b_to_a,
-        image_a=image_a,
+        canvas_a=canvas_a,
+        canvas_b=canvas_b,
+        canvas_offset=canvas_offset,
         inlier_count=inlier_count,
         mean_alignment_error_px=mean_alignment_error_px,
         homography=homography,
